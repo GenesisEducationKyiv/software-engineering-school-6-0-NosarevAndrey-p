@@ -1,0 +1,187 @@
+version: '3.9'
+
+services:
+  db:
+    image: postgres:16-alpine
+    ports:
+    - "5433:5432"
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_MULTIPLE_DATABASES: subscription_db,repo_manager_db
+    volumes: 
+      - db-data:/var/lib/postgresql/data
+      - ./infrastructure/db/init-multiple-databases.sh:/docker-entrypoint-initdb.d/init-multiple-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"] 
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  subscription-service:
+    build:
+      context: .
+      dockerfile: services/subscription-service/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/subscription_db
+      - REPO_MANAGER_SERVICE_URL=http://repo-manager-service:3002
+      - EMAIL_SERVICE_URL=http://email-service:3003
+      - AMQP_URL=amqp://guest:guest@rabbitmq:5672
+      - DB_MIGRATIONS_DIR=src/db/migrations
+      - PORT=3000
+      - LOG_DIR=/app/logs
+    volumes:
+      - subscription-logs:/app/logs
+
+  repo-manager-service:
+    build:
+      context: .
+      dockerfile: services/repo-manager-service/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/repo_manager_db
+      - SUBSCRIPTION_SERVICE_URL=http://subscription-service:3000
+      - AMQP_URL=amqp://guest:guest@rabbitmq:5672
+      - DB_MIGRATIONS_DIR=src/db/migrations
+      - PORT=3002
+      - LOG_DIR=/app/logs
+    volumes:
+      - repo-manager-logs:/app/logs
+
+  email-service:
+    build:
+      context: .
+      dockerfile: services/email-service/Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - BASE_URL=${BASE_URL:-http://localhost:3000}
+      - AMQP_URL=amqp://guest:guest@rabbitmq:5672
+      - PORT=3003
+      - LOG_DIR=/app/logs
+    volumes:
+      - email-logs:/app/logs
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    ports:
+      - "3000:80"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - subscription-service
+
+  prometheus:
+    image: prom/prometheus:v2.49.1
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - subscription-service
+      - repo-manager-service
+      - email-service
+
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./infrastructure/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infrastructure/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  fluent-bit:
+    image: fluent/fluent-bit:3.0.0
+    container_name: fluent-bit
+    volumes:
+      - ./infrastructure/fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
+      - ./infrastructure/fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf
+      - subscription-logs:/var/log/app/subscription
+      - repo-manager-logs:/var/log/app/repo-manager
+      - email-logs:/var/log/app/email
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      subscription-service:
+        condition: service_started
+      repo-manager-service:
+        condition: service_started
+      email-service:
+        condition: service_started
+
+volumes:
+  db-data:
+  es-data:
+  subscription-logs:
+  repo-manager-logs:
+  email-logs:

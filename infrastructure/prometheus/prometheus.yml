@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'subscription-service'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['subscription-service:3000']
+
+  - job_name: 'repo-manager-service'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['repo-manager-service:3002']
+
+  - job_name: 'email-service'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['email-service:3003']
